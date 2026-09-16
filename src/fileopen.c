@@ -7,13 +7,14 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <bpf/libbpf.h>
+#include <limits.h>
 #include "fileopen.h"
 #include "fileopen.skel.h"
 
 struct entry {
-	struct file_key key;
+	struct inode_key ikey;
+	struct path_key pkey;
 	struct rule val;
-	const char *path;
 };
 
 static volatile bool stop;
@@ -36,6 +37,7 @@ static int handle_event(void *ctx, void *data, size_t len)
 {
 	const struct event *e = data;
 	const char *mode;
+	const char *match;
 
 	switch (e->flags & 0003) {
 		case 1:  
@@ -49,7 +51,18 @@ static int handle_event(void *ctx, void *data, size_t len)
 			break;
 	}
 
-	printf("%-8u %-8u %-8s %-10u %-12llu %-16s\n", e->pid, e->uid, mode, e->dev, e->ino, e->comm);
+	if (e->inode_flag && e->path_flag) {
+		match = "both";
+	} else if (e->inode_flag) {
+		match = "ino";
+	} else {
+		match = "path";
+	}                               
+	printf("%-8u %-8u %-6s %-6s %-16s %s\n",
+		e->tgid, e->uid, mode, match, e->comm, e->path);
+	printf("pid=%u ppid=%u ruid=%u loginuid=%u dev=%u ino=%llu cgroup=%llu mntns=%u pidns=%u\n\n",
+	    e->pid, e->ppid, e->ruid, e->loginuid, e->dev, e->ino,
+	    (unsigned long long)e->cgroup_id, e->mnt_ns, e->pid_ns);
 	return 0;
 }
 
@@ -77,6 +90,7 @@ int main(int argc, char **argv)
 
 	for (i = 1; i < argc; i++) {
 		struct stat sb;
+		char real_path[PATH_MAX];
 
 		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
 			instructions(argv[0]);
@@ -104,16 +118,26 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		if (stat(argv[i], &sb) == -1) {
+		if (!realpath(argv[i], real_path)) {
 			fprintf(stderr, "%s: %s\n", argv[i], strerror(errno));
 			continue;
 		}
 
-		entries[n_entries].key.ino = sb.st_ino;
-		entries[n_entries].key.dev = (major(sb.st_dev) << 20) | minor(sb.st_dev);
+		if (strlen(real_path) >= PATH_MAX_LEN) {
+			fprintf(stderr, "%s: path too long\n", real_path);
+			continue;
+		}
+
+		if (stat(real_path, &sb) == -1) {
+			fprintf(stderr, "%s: %s\n", real_path, strerror(errno));
+			continue;
+		}
+
+		entries[n_entries].ikey.ino = sb.st_ino;
+		entries[n_entries].ikey.dev = (major(sb.st_dev) << 20) | minor(sb.st_dev);
 		entries[n_entries].val.on_read = opt_r;
 		entries[n_entries].val.on_write = opt_w;
-		entries[n_entries].path = argv[i];
+		strncpy(entries[n_entries].pkey.path, real_path, PATH_MAX_LEN - 1);
 		n_entries++;
 	}
 
@@ -134,20 +158,30 @@ int main(int argc, char **argv)
 	}
 
 	for (i = 0; i < n_entries; i++) {
-		err = bpf_map__update_elem(skel->maps.watched,
-					   &entries[i].key, sizeof(entries[i].key),
+		err = bpf_map__update_elem(skel->maps.watched_inode,
+					   &entries[i].ikey, sizeof(entries[i].ikey),
 					   &entries[i].val, sizeof(entries[i].val),
 					   BPF_ANY);
 		if (err) {
-			fprintf(stderr, "failed to add %s: %d\n", entries[i].path, err);
+			fprintf(stderr, "failed to add %s: %d\n", entries[i].pkey.path, err);
+			ret = 1;
+			goto cleanup;
+		}
+
+		err = bpf_map__update_elem(skel->maps.watched_path,
+					   &entries[i].pkey, sizeof(entries[i].pkey),
+					   &entries[i].val, sizeof(entries[i].val),
+					   BPF_ANY);
+		if (err) {
+			fprintf(stderr, "failed to add %s: %d\n", entries[i].pkey.path, err);
 			ret = 1;
 			goto cleanup;
 		}
 
 		printf("watching %s (ino=%llu dev=%u, %s%s)\n",
-		       entries[i].path,
-		       (unsigned long long)entries[i].key.ino,
-		       entries[i].key.dev,
+		       entries[i].pkey.path,
+		       (unsigned long long)entries[i].ikey.ino,
+		       entries[i].ikey.dev,
 		       entries[i].val.on_read ? "r" : "",
 		       entries[i].val.on_write ? "w" : "");
 	}
@@ -166,7 +200,8 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	printf("%-8s %-8s %-8s %-10s %-12s %-16s\n", "PID", "UID", "MODE", "DEV", "INO", "COMM");
+	printf("%-8s %-8s %-6s %-6s %-16s %s\n",
+		"PID", "UID", "MODE", "MATCH", "COMM", "FILE");
 
 	while (!stop) {
 		err = ring_buffer__poll(rb, 100);
