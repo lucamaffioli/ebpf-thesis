@@ -2,7 +2,7 @@
 
 An eBPF program that traces `open()` calls on a configurable set of files, using the LSM `file_open` hook.
 
-Files are identified by the pair (inode, device); paths are resolved in user space with `stat()` and stored in a BPF hash map.
+Files are identified by the pair (inode, device) and their absolute path. Paths are resolved in user space using `realpath()` and `stat()` and stored in two separate BPF hash maps.
 
 ## Requirements
 
