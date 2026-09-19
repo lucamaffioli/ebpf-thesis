@@ -8,6 +8,7 @@
 #include <sys/sysmacros.h>
 #include <bpf/libbpf.h>
 #include <limits.h>
+#include <time.h>
 #include "fileopen.h"
 #include "fileopen.skel.h"
 
@@ -33,36 +34,94 @@ static void instructions(const char *prog)
 	fprintf(stderr, "Options apply to the files that follow them.\n");
 }
 
+static long long tai_offset_ns;
+
+static void init_tai_offset(void)
+{
+	struct timespec tai, real;
+
+	clock_gettime(CLOCK_TAI, &tai);
+	clock_gettime(CLOCK_REALTIME, &real);
+
+	tai_offset_ns = (tai.tv_sec - real.tv_sec) * 1000000000LL + (tai.tv_nsec - real.tv_nsec);
+}
+
 static int handle_event(void *ctx, void *data, size_t len)
 {
 	const struct event *e = data;
-	const char *mode;
 	const char *match;
 
-	switch (e->flags & 0003) {
-		case 1:  
-			mode = "W";  
+	unsigned long long utc_ns = e->ts - tai_offset_ns;
+	time_t sec = utc_ns / 1000000000ULL;
+	long msec = (utc_ns % 1000000000ULL) / 1000000;
+	struct tm tm;
+	char tbuf[64];
+
+	localtime_r(&sec, &tm);
+	strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tm);
+
+	if (e->inode_flag && e->path_flag)
+		match = "both";
+	else if (e->inode_flag)
+		match = "ino";
+	else
+		match = "path";
+
+	switch (e->hook) {
+	case HK_OPEN: {
+		const char *mode;
+
+		switch (e->flags & 0003) {
+		case 1:
+			mode = "W";
 			break;
-		case 2:  
-			mode = "RW"; 
+		case 2:
+			mode = "RW";
 			break;
-		default: 
-			mode = "R";  
+		default:
+			mode = "R";
 			break;
+		}
+
+		printf("[%s.%03ld] OPEN   | %-4s | %-2s | comm=\"%-12s\" path=\"%s\"",
+		       tbuf, msec, match, mode, e->comm, e->path);
+
+		if (e->inode_changed)
+			printf(" [replaced]");
+
+		if (strcmp(e->path, e->watched) != 0)
+			printf(" watched=\"%s\"", e->watched);
+
+		printf("\n");
+		break;
 	}
 
-	if (e->inode_flag && e->path_flag) {
-		match = "both";
-	} else if (e->inode_flag) {
-		match = "ino";
-	} else {
-		match = "path";
-	}                               
-	printf("%-8u %-8u %-6s %-6s %-16s %s\n",
-		e->tgid, e->uid, mode, match, e->comm, e->path);
-	printf("pid=%u ppid=%u ruid=%u loginuid=%u dev=%u ino=%llu cgroup=%llu mntns=%u pidns=%u\n\n",
-	    e->pid, e->ppid, e->ruid, e->loginuid, e->dev, e->ino,
-	    (unsigned long long)e->cgroup_id, e->mnt_ns, e->pid_ns);
+	case HK_UNLINK:
+		printf("[%s.%03ld] UNLINK | %-4s |    | comm=\"%-12s\" watched=\"%s\"\n",
+		       tbuf, msec, match, e->comm, e->watched);
+		break;
+
+	case HK_RENAME:
+		printf("[%s.%03ld] RENAME | %-4s |    | comm=\"%-12s\" \"%s\" -> \"%s\" watched=\"%s\"\n",
+		       tbuf, msec, match, e->comm, e->path, e->other, e->watched);
+		break;
+
+	case HK_LINK:
+		printf("[%s.%03ld] LINK   | %-4s |    | comm=\"%-12s\" new=\"%s\" watched=\"%s\"\n",
+		       tbuf, msec, match, e->comm, e->other, e->watched);
+		break;
+
+	default:
+		printf("[%s.%03ld] hook=%u | comm=\"%s\"\n",
+		       tbuf, msec, e->hook, e->comm);
+		break;
+	}
+
+	printf("pid=%u ppid=%u uid=%u ruid=%u loginuid=%u dev=%u ino=%llu cgroup=%llu mntns=%u pidns=%u\n\n",
+	       e->pid, e->ppid, e->uid, e->ruid, e->loginuid, e->dev,
+	       (unsigned long long)e->ino, (unsigned long long)e->cgroup_id,
+	       e->mnt_ns, e->pid_ns);
+
 	return 0;
 }
 
@@ -76,6 +135,8 @@ int main(int argc, char **argv)
 	int opt_w = 1;
 	int ret = 0;
 	int err, i;
+
+	init_tai_offset();
 
 	if (argc < 2) {
 		instructions(argv[0]);
@@ -137,6 +198,7 @@ int main(int argc, char **argv)
 		entries[n_entries].ikey.dev = (major(sb.st_dev) << 20) | minor(sb.st_dev);
 		entries[n_entries].val.on_read = opt_r;
 		entries[n_entries].val.on_write = opt_w;
+		entries[n_entries].val.current_ikey = entries[n_entries].ikey;
 		strncpy(entries[n_entries].pkey.path, real_path, PATH_MAX_LEN - 1);
 		n_entries++;
 	}
@@ -158,8 +220,8 @@ int main(int argc, char **argv)
 	}
 
 	for (i = 0; i < n_entries; i++) {
-		err = bpf_map__update_elem(skel->maps.watched_inode,
-					   &entries[i].ikey, sizeof(entries[i].ikey),
+		err = bpf_map__update_elem(skel->maps.watched_path,
+					   &entries[i].pkey, sizeof(entries[i].pkey),
 					   &entries[i].val, sizeof(entries[i].val),
 					   BPF_ANY);
 		if (err) {
@@ -168,9 +230,9 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		err = bpf_map__update_elem(skel->maps.watched_path,
+		err = bpf_map__update_elem(skel->maps.resolved_inode,
+					   &entries[i].ikey, sizeof(entries[i].ikey),
 					   &entries[i].pkey, sizeof(entries[i].pkey),
-					   &entries[i].val, sizeof(entries[i].val),
 					   BPF_ANY);
 		if (err) {
 			fprintf(stderr, "failed to add %s: %d\n", entries[i].pkey.path, err);
@@ -199,9 +261,6 @@ int main(int argc, char **argv)
 		ret = 1;
 		goto cleanup;
 	}
-
-	printf("%-8s %-8s %-6s %-6s %-16s %s\n",
-		"PID", "UID", "MODE", "MATCH", "COMM", "FILE");
 
 	while (!stop) {
 		err = ring_buffer__poll(rb, 100);
