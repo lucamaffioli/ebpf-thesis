@@ -97,13 +97,21 @@ static int handle_event(void *ctx, void *data, size_t len)
 	}
 
 	case HK_UNLINK:
-		printf("[%s.%03ld] UNLINK | %-4s |    | comm=\"%-12s\" watched=\"%s\"\n",
-		       tbuf, msec, match, e->comm, e->watched);
+		printf("[%s.%03ld] UNLINK | %-4s |    | comm=\"%-12s\" removed=\"%s\"",
+		       tbuf, msec, match, e->comm, e->other[0] ? e->other : "?");
+		if (strcmp(e->other, e->watched) != 0)
+			printf(" watched=\"%s\"", e->watched);
+		printf("\n");
 		break;
 
 	case HK_RENAME:
-		printf("[%s.%03ld] RENAME | %-4s |    | comm=\"%-12s\" \"%s\" -> \"%s\" watched=\"%s\"\n",
-		       tbuf, msec, match, e->comm, e->path, e->other, e->watched);
+		printf("[%s.%03ld] RENAME | %-4s |    | comm=\"%-12s\" ", tbuf, msec, match, e->comm);
+		if (e->path[0])
+			printf("\"%s\" -> ", e->path);
+		printf("\"%s\"", e->other);
+		if (strcmp(e->other, e->watched) != 0)
+			printf(" watched=\"%s\"", e->watched);
+		printf("\n");
 		break;
 
 	case HK_LINK:

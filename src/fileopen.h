@@ -3,6 +3,8 @@
 
 #define TASK_COMM_LEN 16
 #define PATH_MAX_LEN 256
+#define NAME_MAX_LEN 64
+
 #define HK_OPEN   1
 #define HK_UNLINK 2
 #define HK_RENAME 3
