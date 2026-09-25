@@ -84,15 +84,20 @@ static int handle_event(void *ctx, void *data, size_t len)
 		}
 
 		printf("[%s.%03ld] OPEN   | %-4s | %-2s | comm=\"%-12s\" path=\"%s\"",
-		       tbuf, msec, match, mode, e->comm, e->path);
+			tbuf, msec, match, mode, e->comm, e->path);
 
-		if (e->inode_changed)
+		if (!e->inode_flag && e->path_flag && e->foreign_ns) {
+			printf(" [PATH_COLLISION]");
+		} else if (e->inode_changed) {
 			printf(" [replaced]");
+		} else if (e->inode_flag && !e->path_flag) {
+			printf(" [ALIAS_ACCESS]");
+		}
 
-		if (strcmp(e->path, e->watched) != 0)
+		if (strcmp(e->path, e->watched) != 0) {
 			printf(" watched=\"%s\"", e->watched);
+		}
 
-		printf("\n");
 		break;
 	}
 
@@ -101,7 +106,6 @@ static int handle_event(void *ctx, void *data, size_t len)
 		       tbuf, msec, match, e->comm, e->other[0] ? e->other : "?");
 		if (strcmp(e->other, e->watched) != 0)
 			printf(" watched=\"%s\"", e->watched);
-		printf("\n");
 		break;
 
 	case HK_RENAME:
@@ -111,19 +115,23 @@ static int handle_event(void *ctx, void *data, size_t len)
 		printf("\"%s\"", e->other);
 		if (strcmp(e->other, e->watched) != 0)
 			printf(" watched=\"%s\"", e->watched);
-		printf("\n");
 		break;
 
 	case HK_LINK:
-		printf("[%s.%03ld] LINK   | %-4s |    | comm=\"%-12s\" new=\"%s\" watched=\"%s\"\n",
+		printf("[%s.%03ld] LINK   | %-4s |    | comm=\"%-12s\" new=\"%s\" watched=\"%s\"",
 		       tbuf, msec, match, e->comm, e->other, e->watched);
 		break;
 
 	default:
-		printf("[%s.%03ld] hook=%u | comm=\"%s\"\n",
-		       tbuf, msec, e->hook, e->comm);
+		printf("[%s.%03ld] hook=%u | comm=\"%s\"", tbuf, msec, e->hook, e->comm);
 		break;
 	}
+
+	if (e->foreign_ns) {
+		printf(" [ns=%u]", e->mnt_ns);
+	}
+
+	printf("\n");
 
 	printf("pid=%u ppid=%u uid=%u ruid=%u loginuid=%u dev=%u ino=%llu cgroup=%llu mntns=%u pidns=%u\n\n",
 	       e->pid, e->ppid, e->uid, e->ruid, e->loginuid, e->dev,
@@ -155,6 +163,13 @@ int main(int argc, char **argv)
 	if (!entries) {
 		fprintf(stderr, "out of memory\n");
 		return 1;
+	}
+
+	struct stat stat_ns;
+	__u32 proc_mnt_ns = 0;
+
+	if (stat("/proc/self/ns/mnt", &stat_ns) == 0) {
+		proc_mnt_ns = stat_ns.st_ino;
 	}
 
 	for (i = 1; i < argc; i++) {
@@ -208,6 +223,7 @@ int main(int argc, char **argv)
 		entries[n_entries].val.on_write = opt_w;
 		entries[n_entries].val.current_ikey = entries[n_entries].ikey;
 		strncpy(entries[n_entries].pkey.path, real_path, PATH_MAX_LEN - 1);
+		entries[n_entries].val.mnt_ns = proc_mnt_ns;
 		n_entries++;
 	}
 
@@ -248,10 +264,11 @@ int main(int argc, char **argv)
 			goto cleanup;
 		}
 
-		printf("watching %s (ino=%llu dev=%u, %s%s)\n",
+		printf("watching %s (ino=%llu dev=%u mntns=%u, %s %s)\n",
 		       entries[i].pkey.path,
 		       (unsigned long long)entries[i].ikey.ino,
 		       entries[i].ikey.dev,
+			   entries[i].val.mnt_ns,
 		       entries[i].val.on_read ? "r" : "",
 		       entries[i].val.on_write ? "w" : "");
 	}

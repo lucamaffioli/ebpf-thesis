@@ -28,6 +28,7 @@ struct event {
 	__u32 path_flag;
 	__u32 inode_changed;
 	__u32 hook;
+	__u32 foreign_ns;
 	char comm[TASK_COMM_LEN];
 	char path[PATH_MAX_LEN];
 	char watched[PATH_MAX_LEN];
@@ -47,6 +48,7 @@ struct rule {
 	__u8 on_read;
 	__u8 on_write;
 	struct inode_key current_ikey;
+	__u32 mnt_ns;
 };
 
 #endif
